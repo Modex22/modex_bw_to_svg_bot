@@ -199,28 +199,58 @@ def make_svg(image_bytes: bytes, mode: str, threshold: int):
             )
             root = ET.parse(output_path).getroot()
 
-        path_data = []
-        for element in root.iter():
-            if not element.tag.endswith("path"):
-                continue
-            d = element.attrib.get("d", "").strip()
-            if not d:
-                continue
-            fill = element.attrib.get("fill", "#000000").strip().lower()
-            if fill in {"white", "#fff", "#ffffff", "rgb(255,255,255)"}:
-                continue
-            path_data.append(d)
+        # IMPORTANT: Keep VTracer's original coordinate system and all
+        # parent groups/transforms. Extracting only each path's `d` and then
+        # applying a cropped viewBox caused the artwork to render as a tiny,
+        # clipped fragment. VTracer traces the full input canvas, so preserve
+        # its full viewBox and nested transforms in the returned SVG.
+        white_fills = {"white", "#fff", "#ffffff", "rgb(255,255,255)"}
 
-        if not path_data:
+        def remove_white_shapes(parent):
+            removed = 0
+            for child in list(parent):
+                tag = child.tag.rsplit("}", 1)[-1].lower()
+                fill = child.attrib.get("fill", "").strip().lower()
+                # Remove white path/shape layers so the SVG stays transparent.
+                if tag in {"path", "rect", "polygon", "circle", "ellipse"} and fill in white_fills:
+                    parent.remove(child)
+                    removed += 1
+                    continue
+                removed += remove_white_shapes(child)
+            return removed
+
+        remove_white_shapes(root)
+
+        path_count = sum(
+            1 for element in root.iter()
+            if element.tag.rsplit("}", 1)[-1].lower() == "path"
+            and element.attrib.get("d", "").strip()
+            and element.attrib.get("fill", "#000000").strip().lower() not in white_fills
+        )
+        if path_count == 0:
             raise ValueError("VTracer returned no foreground paths.")
 
+        # Preserve the VTracer root viewBox because its path coordinates and
+        # transforms are defined in that coordinate space. Normalize the
+        # outer dimensions only; do not crop to the mask bounds here.
+        v_viewbox = root.attrib.get("viewBox", f"0 0 {w} {h}")
+        try:
+            vb = [float(value) for value in v_viewbox.replace(",", " ").split()]
+            if len(vb) != 4 or vb[2] <= 0 or vb[3] <= 0:
+                raise ValueError
+            viewbox_value = " ".join(str(value) for value in vb)
+        except (ValueError, TypeError):
+            viewbox_value = f"0 0 {w} {h}"
+
+        # Serialize original children, preserving nested groups and transforms.
+        children = "".join(ET.tostring(child, encoding="unicode") for child in list(root))
         svg = f'''<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="{min_x} {min_y} {width} {height}">
-  <g fill="#000000">{' '.join(f'<path d="{d}" fill-rule="evenodd"/>' for d in path_data)}</g>
+<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="{viewbox_value}">
+{children}
 </svg>
 '''.encode("utf-8")
         engine = "VTracer spline"
-        path_count = len(path_data)
+        width, height = w, h
 
     except Exception as exc:
         logger.warning("VTracer failed; falling back to OpenCV: %s", exc)
