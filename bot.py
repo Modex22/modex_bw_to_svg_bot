@@ -1,47 +1,64 @@
+
 import io
 import os
 import sqlite3
 import logging
 import tempfile
 import xml.etree.ElementTree as ET
-import re
 from pathlib import Path
 
 import cv2
 import numpy as np
 import vtracer
 from PIL import Image, ImageOps, UnidentifiedImageError
+
 from telegram import (
-    BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, Update,
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    MenuButtonCommands,
+    Update,
 )
 from telegram.constants import ChatAction
 from telegram.ext import (
-    Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters,
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
 )
 
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+
 DATA_DIR = Path(os.getenv("DATA_DIR", "."))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "settings.db"
 
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
+
 DEFAULT_THRESHOLD = 160
 MIN_THRESHOLD = 1
 MAX_THRESHOLD = 254
-MIN_COMPONENT_AREA = 2.0
-PADDING = 2
 
-VTRACER_FILTER_SPECKLE = 2
-VTRACER_CORNER_THRESHOLD = 60
-VTRACER_LENGTH_THRESHOLD = 3.5
-VTRACER_PATH_PRECISION = 3
+MIN_COMPONENT_AREA = 2
+PADDING = 2
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
+
 logger = logging.getLogger("modex-bw-to-svg")
 
+
+# ============================================================
+# DATABASE AND SETTINGS
+# ============================================================
 
 def db_connect():
     return sqlite3.connect(DB_PATH)
@@ -64,19 +81,32 @@ def get_settings(user_id: int) -> tuple[str, int]:
             "SELECT mode, threshold FROM user_settings WHERE user_id = ?",
             (user_id,),
         ).fetchone()
+
         if row:
             return row[0], int(row[1])
+
         conn.execute(
-            "INSERT OR IGNORE INTO user_settings (user_id, mode, threshold) VALUES (?, 'auto', ?)",
+            """
+            INSERT OR IGNORE INTO user_settings
+            (user_id, mode, threshold)
+            VALUES (?, 'auto', ?)
+            """,
             (user_id, DEFAULT_THRESHOLD),
         )
+
         return "auto", DEFAULT_THRESHOLD
 
 
-def set_settings(user_id: int, mode: str, threshold: int | None = None):
+def set_settings(
+    user_id: int,
+    mode: str,
+    threshold: int | None = None,
+):
     _, current_threshold = get_settings(user_id)
+
     if threshold is None:
         threshold = current_threshold
+
     with db_connect() as conn:
         conn.execute("""
             INSERT INTO user_settings (user_id, mode, threshold)
@@ -87,174 +117,337 @@ def set_settings(user_id: int, mode: str, threshold: int | None = None):
         """, (user_id, mode, int(threshold)))
 
 
-def threshold_mask(gray: np.ndarray, mode: str, threshold: int):
-    """White pixels in the returned mask represent the foreground artwork."""
+# ============================================================
+# IMAGE THRESHOLDING
+# ============================================================
+
+def threshold_mask(
+    gray: np.ndarray,
+    mode: str,
+    threshold: int,
+):
+    """White pixels in the mask represent dark foreground artwork."""
+
     if mode == "auto":
         used_threshold, mask = cv2.threshold(
-            gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
+            gray,
+            0,
+            255,
+            cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU,
         )
         return mask, int(used_threshold)
-    _, mask = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY_INV)
+
+    _, mask = cv2.threshold(
+        gray,
+        threshold,
+        255,
+        cv2.THRESH_BINARY_INV,
+    )
+
     return mask, int(threshold)
 
 
-def _opencv_fallback_svg(mask: np.ndarray) -> tuple[bytes, int, int, int]:
-    """Build a crisp, transparent SVG from contours if VTracer fails."""
-    contours, hierarchy = cv2.findContours(
-        mask.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
+def remove_tiny_components(mask: np.ndarray) -> np.ndarray:
+    """Remove tiny disconnected specks without blurring the logo."""
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        (mask > 0).astype(np.uint8),
+        8,
     )
+
+    cleaned = np.zeros_like(mask)
+
+    for label in range(1, count):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+
+        if area >= MIN_COMPONENT_AREA:
+            cleaned[labels == label] = 255
+
+    return cleaned
+
+
+# ============================================================
+# OPENCV FALLBACK
+# ============================================================
+
+def opencv_fallback_svg(
+    mask: np.ndarray,
+) -> tuple[bytes, int, int, int]:
+    """
+    Generate SVG paths from contours.
+
+    Uses the original full canvas coordinate system to avoid
+    cropping artwork by changing the viewBox independently.
+    """
+
+    contours, hierarchy = cv2.findContours(
+        mask.copy(),
+        cv2.RETR_TREE,
+        cv2.CHAIN_APPROX_NONE,
+    )
+
     if not contours:
-        raise ValueError("OpenCV couldn't find any usable logo contours.")
+        raise ValueError(
+            "OpenCV couldn't find usable logo contours."
+        )
 
-    paths = []
-    for contour in contours:
+    height, width = mask.shape
+    hierarchy_rows = hierarchy[0] if hierarchy is not None else None
+
+    path_data = []
+
+    for index, contour in enumerate(contours):
         area = abs(float(cv2.contourArea(contour)))
-        if area < MIN_COMPONENT_AREA:
-            continue
+
+        parent_index = (
+            int(hierarchy_rows[index][3])
+            if hierarchy_rows is not None
+            else -1
+        )
+
+        # Small epsilon preserves corners and jagged logo details.
         perimeter = cv2.arcLength(contour, True)
-        epsilon = max(0.15, perimeter * 0.0005)
-        approx = cv2.approxPolyDP(contour, epsilon, True).reshape(-1, 2)
-        if len(approx) < 3:
+        epsilon = max(0.1, perimeter * 0.00035)
+
+        points = cv2.approxPolyDP(
+            contour,
+            epsilon,
+            True,
+        ).reshape(-1, 2)
+
+        if len(points) < 3:
             continue
-        d = f"M {int(approx[0][0])} {int(approx[0][1])} "
-        d += " ".join(f"L {int(x)} {int(y)}" for x, y in approx[1:])
+
+        # Keep tiny nested contours because they may be cutouts.
+        if area < MIN_COMPONENT_AREA and parent_index < 0:
+            continue
+
+        d = f"M {int(points[0][0])} {int(points[0][1])} "
+
+        d += " ".join(
+            f"L {int(x)} {int(y)}"
+            for x, y in points[1:]
+        )
+
         d += " Z"
-        paths.append(d)
+        path_data.append(d)
 
-    if not paths:
-        raise ValueError("OpenCV couldn't generate usable vector paths.")
+    if not path_data:
+        raise ValueError(
+            "OpenCV couldn't generate usable vector paths."
+        )
 
-    ys, xs = np.where(mask > 0)
-    if len(xs) == 0:
-        raise ValueError("No foreground pixels were found for fallback tracing.")
-    min_x = max(0, int(xs.min()) - PADDING)
-    min_y = max(0, int(ys.min()) - PADDING)
-    max_x = min(mask.shape[1] - 1, int(xs.max()) + PADDING)
-    max_y = min(mask.shape[0] - 1, int(ys.max()) + PADDING)
-    width = max(1, max_x - min_x + 1)
-    height = max(1, max_y - min_y + 1)
-    svg = f'''<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="{min_x} {min_y} {width} {height}">
-  <path d="{' '.join(paths)}" fill="#000000" fill-rule="evenodd" clip-rule="evenodd"/>
+    # Full-canvas viewBox: path coordinates remain consistent.
+    svg = f"""<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="{width}" height="{height}"
+     viewBox="0 0 {width} {height}">
+    <path d="{' '.join(path_data)}"
+          fill="#000000"
+          fill-rule="evenodd"
+          clip-rule="evenodd"/>
 </svg>
-'''.encode("utf-8")
-    return svg, width, height, len(paths)
+""".encode("utf-8")
+
+    return svg, width, height, len(path_data)
 
 
-def make_svg(image_bytes: bytes, mode: str, threshold: int):
-    """Try VTracer first; automatically fall back to crisp OpenCV paths."""
+# ============================================================
+# VTRACER OUTPUT VALIDATION
+# ============================================================
+
+def has_usable_paths(root: ET.Element) -> bool:
+    return any(
+        element.tag.rsplit("}", 1)[-1].lower() == "path"
+        and element.attrib.get("d", "").strip()
+        for element in root.iter()
+    )
+
+
+def make_svg(
+    image_bytes: bytes,
+    mode: str,
+    threshold: int,
+):
+    """
+    Try VTracer first, then OpenCV if VTracer fails.
+
+    Returns SVG bytes and conversion metadata.
+    """
+
     try:
         with Image.open(io.BytesIO(image_bytes)) as opened:
             image = ImageOps.exif_transpose(opened).convert("RGBA")
+
     except (UnidentifiedImageError, OSError) as exc:
         raise ValueError(
-            "I couldn't read that image. Please send a PNG, JPG, WEBP, BMP or TIFF."
+            "I couldn't read that image. Send a PNG, JPG, WEBP, BMP or TIFF."
         ) from exc
 
     rgba = np.array(image)
     alpha = rgba[:, :, 3]
-    gray = cv2.cvtColor(rgba[:, :, :3], cv2.COLOR_RGB2GRAY)
-    mask, used_threshold = threshold_mask(gray, mode, threshold)
+
+    gray = cv2.cvtColor(
+        rgba[:, :, :3],
+        cv2.COLOR_RGB2GRAY,
+    )
+
+    mask, used_threshold = threshold_mask(
+        gray,
+        mode,
+        threshold,
+    )
+
+    # Ignore pixels that were already transparent.
     mask[alpha < 10] = 0
 
-    # Conservative cleanup: no blur/morphology, preserving fine logo cuts.
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(
-        (mask > 0).astype(np.uint8), 8
-    )
-    cleaned = np.zeros_like(mask)
-    for label in range(1, count):
-        if int(stats[label, cv2.CC_STAT_AREA]) >= MIN_COMPONENT_AREA:
-            cleaned[labels == label] = 255
+    cleaned = remove_tiny_components(mask)
 
     if not np.any(cleaned):
         raise ValueError(
-            "No dark artwork was detected. Try /threshold 190, or send a higher-contrast image."
+            "No dark artwork was detected. Try /threshold 190 "
+            "or send a higher-contrast image."
         )
 
-    h, w = cleaned.shape
-    ys, xs = np.where(cleaned > 0)
-    min_x = max(0, int(xs.min()) - PADDING)
-    min_y = max(0, int(ys.min()) - PADDING)
-    max_x = min(w - 1, int(xs.max()) + PADDING)
-    max_y = min(h - 1, int(ys.max()) + PADDING)
-    width = max(1, max_x - min_x + 1)
-    height = max(1, max_y - min_y + 1)
+    height, width = cleaned.shape
+
+    # --------------------------------------------------------
+    # FIRST ENGINE: VTRACER
+    # --------------------------------------------------------
 
     try:
-        bw = np.full((h, w, 3), 255, dtype=np.uint8)
+        # VTracer receives a full-size black-and-white image.
+        # Do not crop it before tracing.
+        bw = np.full(
+            (height, width, 3),
+            255,
+            dtype=np.uint8,
+        )
+
         bw[cleaned > 0] = (0, 0, 0)
-        with tempfile.TemporaryDirectory(prefix="modex_vtracer_") as tmp:
+
+        with tempfile.TemporaryDirectory(
+            prefix="modex_vtracer_"
+        ) as tmp:
+
             input_path = Path(tmp) / "input.png"
             output_path = Path(tmp) / "traced.svg"
-            Image.fromarray(bw, mode="RGB").save(input_path, format="PNG")
-            vtracer.convert_image_to_svg_py(
-                str(input_path), str(output_path),
-                colormode="binary", hierarchical="stacked", mode="spline",
-                filter_speckle=VTRACER_FILTER_SPECKLE,
-                color_precision=6, layer_difference=16,
-                corner_threshold=VTRACER_CORNER_THRESHOLD,
-                length_threshold=VTRACER_LENGTH_THRESHOLD,
-                max_iterations=10, splice_threshold=45,
-                path_precision=VTRACER_PATH_PRECISION,
+
+            Image.fromarray(bw, mode="RGB").save(
+                input_path,
+                format="PNG",
             )
+
+            vtracer.convert_image_to_svg_py(
+                str(input_path),
+                str(output_path),
+                colormode="binary",
+                hierarchical="stacked",
+                mode="spline",
+                filter_speckle=2,
+                color_precision=6,
+                layer_difference=16,
+                corner_threshold=60,
+                length_threshold=3.5,
+                max_iterations=10,
+                splice_threshold=45,
+                path_precision=3,
+            )
+
             root = ET.parse(output_path).getroot()
 
-        # IMPORTANT: Keep VTracer's original coordinate system and all
-        # parent groups/transforms. Extracting only each path's `d` and then
-        # applying a cropped viewBox caused the artwork to render as a tiny,
-        # clipped fragment. VTracer traces the full input canvas, so preserve
-        # its full viewBox and nested transforms in the returned SVG.
-        white_fills = {"white", "#fff", "#ffffff", "rgb(255,255,255)"}
+        if not has_usable_paths(root):
+            raise ValueError(
+                "VTracer returned no usable paths."
+            )
+
+        # ----------------------------------------------------
+        # FIX: CORRECT THE CROPPED VIEWBOX
+        # ----------------------------------------------------
+        #
+        # The source image passed to VTracer uses coordinates
+        # from (0, 0) to (width, height).
+        #
+        # The previous output showed an offset viewBox such as
+        # "76 258 582 201" while paths used coordinates near
+        # the origin. That combination can crop the artwork.
+        #
+        # Normalize the outer canvas to the original input size.
+        # Keep nested groups and transformations intact.
+
+        root.set("width", str(width))
+        root.set("height", str(height))
+        root.set("viewBox", f"0 0 {width} {height}")
+
+        root.attrib.pop("x", None)
+        root.attrib.pop("y", None)
+
+        # ----------------------------------------------------
+        # REMOVE EXPLICIT WHITE BACKGROUND SHAPES
+        # ----------------------------------------------------
+
+        white_fills = {
+            "white",
+            "#fff",
+            "#ffffff",
+            "rgb(255,255,255)",
+        }
 
         def remove_white_shapes(parent):
-            removed = 0
             for child in list(parent):
                 tag = child.tag.rsplit("}", 1)[-1].lower()
                 fill = child.attrib.get("fill", "").strip().lower()
-                # Remove white path/shape layers so the SVG stays transparent.
-                if tag in {"path", "rect", "polygon", "circle", "ellipse"} and fill in white_fills:
+
+                if (
+                    tag in {
+                        "path",
+                        "rect",
+                        "polygon",
+                        "circle",
+                        "ellipse",
+                    }
+                    and fill in white_fills
+                ):
                     parent.remove(child)
-                    removed += 1
-                    continue
-                removed += remove_white_shapes(child)
-            return removed
+                else:
+                    remove_white_shapes(child)
 
         remove_white_shapes(root)
 
+        if not has_usable_paths(root):
+            raise ValueError(
+                "VTracer output contained no foreground paths."
+            )
+
         path_count = sum(
-            1 for element in root.iter()
+            1
+            for element in root.iter()
             if element.tag.rsplit("}", 1)[-1].lower() == "path"
             and element.attrib.get("d", "").strip()
-            and element.attrib.get("fill", "#000000").strip().lower() not in white_fills
         )
-        if path_count == 0:
-            raise ValueError("VTracer returned no foreground paths.")
 
-        # Preserve the VTracer root viewBox because its path coordinates and
-        # transforms are defined in that coordinate space. Normalize the
-        # outer dimensions only; do not crop to the mask bounds here.
-        v_viewbox = root.attrib.get("viewBox", f"0 0 {w} {h}")
-        try:
-            vb = [float(value) for value in v_viewbox.replace(",", " ").split()]
-            if len(vb) != 4 or vb[2] <= 0 or vb[3] <= 0:
-                raise ValueError
-            viewbox_value = " ".join(str(value) for value in vb)
-        except (ValueError, TypeError):
-            viewbox_value = f"0 0 {w} {h}"
+        svg = ET.tostring(
+            root,
+            encoding="utf-8",
+            xml_declaration=True,
+        )
 
-        # Serialize original children, preserving nested groups and transforms.
-        children = "".join(ET.tostring(child, encoding="unicode") for child in list(root))
-        svg = f'''<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="{viewbox_value}">
-{children}
-</svg>
-'''.encode("utf-8")
         engine = "VTracer spline"
-        width, height = w, h
+
+    # --------------------------------------------------------
+    # FALLBACK ENGINE: OPENCV
+    # --------------------------------------------------------
 
     except Exception as exc:
-        logger.warning("VTracer failed; falling back to OpenCV: %s", exc)
-        svg, width, height, path_count = _opencv_fallback_svg(cleaned)
+        logger.warning(
+            "VTracer failed validation or conversion; using OpenCV: %s",
+            exc,
+        )
+
+        svg, width, height, path_count = opencv_fallback_svg(
+            cleaned
+        )
+
         engine = "OpenCV fallback"
 
     return svg, {
@@ -267,216 +460,453 @@ def make_svg(image_bytes: bytes, mode: str, threshold: int):
     }
 
 
+# ============================================================
+# TELEGRAM MENU AND HELP
+# ============================================================
+
 HELP_TEXT = (
     "🖤 *MODEX B&W → SVG*\n\n"
-    "Send a logo or black-and-white image and I'll trace it with VTracer spline paths. "
-    "The foreground is black and the background transparent.\n\n"
+    "Send a logo or black-and-white image and I'll trace it into SVG paths.\n\n"
     "*Commands*\n"
-    "/auto — automatic Otsu thresholding\n"
-    "/threshold 160 — manual threshold from 1 to 254\n"
-    "/status — show your current settings\n"
+    "/auto — automatic threshold\n"
+    "/threshold 160 — manual threshold (1–254)\n"
+    "/status — view your settings\n"
     "/help — show this help\n\n"
-    "*Tips*\n"
-    "• Dark pixels become black vector shapes.\n"
-    "• White areas become transparent, including enclosed cutouts.\n"
-    "• VTracer spline tracing gives cleaner curves with corner detection.\n"
-    "• Tiny isolated specks are filtered conservatively.\n"
-    "• Send the highest-resolution image for cleaner paths.\n\n"
-    "This is bitmap tracing, not AI redraw. Very fine details may depend on source quality."
+    "*Features*\n"
+    "• Black foreground (#000000)\n"
+    "• Transparent background\n"
+    "• Sharp logo corners and cuts\n"
+    "• VTracer first, OpenCV fallback\n\n"
+    "Send a high-resolution PNG as a document for the best results."
 )
 
 
 def main_menu_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🖼 Convert an image", callback_data="menu_convert")],
-        [InlineKeyboardButton("⚙️ Automatic mode", callback_data="menu_auto"),
-         InlineKeyboardButton("🎚 Threshold settings", callback_data="menu_threshold")],
-        [InlineKeyboardButton("ℹ️ Help", callback_data="menu_help"),
-         InlineKeyboardButton("📊 My settings", callback_data="menu_status")],
+        [
+            InlineKeyboardButton(
+                "🖼 Convert an image",
+                callback_data="menu_convert",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⚙️ Automatic mode",
+                callback_data="menu_auto",
+            ),
+            InlineKeyboardButton(
+                "🎚 Threshold settings",
+                callback_data="menu_threshold",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "ℹ️ Help",
+                callback_data="menu_help",
+            ),
+            InlineKeyboardButton(
+                "📊 My settings",
+                callback_data="menu_status",
+            ),
+        ],
     ])
 
 
 async def post_init(application: Application):
-    """Register Telegram's native command menu beside the message bar."""
+    """Register commands in Telegram's native menu."""
+
     await application.bot.set_my_commands([
         BotCommand("start", "Open the main menu"),
         BotCommand("auto", "Automatic black and white detection"),
         BotCommand("threshold", "Set or view threshold"),
-        BotCommand("status", "View your current settings"),
+        BotCommand("status", "View current settings"),
         BotCommand("help", "Show instructions"),
     ])
-    await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+
+    await application.bot.set_chat_menu_button(
+        menu_button=MenuButtonCommands()
+    )
 
 
-async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    action = query.data
+# ============================================================
+# COMMAND HANDLERS
+# ============================================================
 
-    if action == "menu_convert":
-        await query.message.reply_text("Send me a black-and-white image as a photo or image document, and I'll return a true SVG with black paths and a transparent background.")
-    elif action == "menu_auto":
-        _, threshold = get_settings(user_id)
-        set_settings(user_id, "auto", threshold)
-        await query.message.reply_text("Automatic threshold enabled. Send an image to convert it. Use /threshold 160 for manual thresholding.")
-    elif action == "menu_threshold":
-        mode, threshold = get_settings(user_id)
-        await query.message.reply_text(
-            f"Current mode: {mode}\nManual threshold: {threshold}\n\n"
-            "Set a value by sending /threshold 160 (choose 1–254). Higher values include more gray pixels."
-        )
-    elif action == "menu_status":
-        mode, threshold = get_settings(user_id)
-        shown = "Otsu (automatic per image)" if mode == "auto" else str(threshold)
-        await query.message.reply_text(
-            f"Mode: {mode}\nThreshold: {shown}\n"
-            "Output: black #000000 SVG paths, transparent background"
-        )
-    elif action == "menu_help":
-        await query.message.reply_text(HELP_TEXT, parse_mode="Markdown", reply_markup=main_menu_keyboard())
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     get_settings(update.effective_user.id)
+
     await update.message.reply_text(
         "🖤 *MODEX B&W → SVG*\n\n"
-        "Welcome! Send a black-and-white image and I'll trace it into a real SVG path. "
-        "The foreground is black and the background is transparent.\n\n"
-        "Choose an option below, or tap the Telegram menu beside the message bar.",
+        "Send a logo or black-and-white image. I'll return black "
+        "vector paths on a transparent background.\n\n"
+        "VTracer is tried first. OpenCV is used automatically "
+        "if VTracer fails.\n\n"
+        "Choose an option below or tap the Telegram menu.",
         parse_mode="Markdown",
         reply_markup=main_menu_keyboard(),
     )
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
-
-
-async def auto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    _, threshold = get_settings(user_id)
-    set_settings(user_id, "auto", threshold)
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     await update.message.reply_text(
-        "Automatic threshold enabled. Send an image to convert it.\n"
-        "Use /threshold 160 to switch to a manual threshold."
+        HELP_TEXT,
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard(),
     )
 
 
-async def threshold_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def auto_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     user_id = update.effective_user.id
+    _, threshold = get_settings(user_id)
+
+    set_settings(user_id, "auto", threshold)
+
+    await update.message.reply_text(
+        "Automatic threshold enabled. Send an image to convert it.\n"
+        "Use /threshold 160 for manual thresholding."
+    )
+
+
+async def threshold_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    user_id = update.effective_user.id
+
     if not context.args:
         mode, threshold = get_settings(user_id)
+
         await update.message.reply_text(
-            f"Current mode: {mode}\nManual threshold: {threshold}\n\n"
-            "Usage: /threshold 160 (choose a value from 1 to 254).\n"
-            "Lower values keep only darker pixels; higher values include more gray pixels."
+            f"Current mode: {mode}\n"
+            f"Manual threshold: {threshold}\n\n"
+            "Usage: /threshold 160 (choose 1–254).\n"
+            "Higher values include more gray pixels."
         )
         return
+
     try:
         value = int(context.args[0])
+
     except ValueError:
-        await update.message.reply_text("Please use a number, e.g. /threshold 160.")
+        await update.message.reply_text(
+            "Use a number, e.g. /threshold 160."
+        )
         return
+
     if not MIN_THRESHOLD <= value <= MAX_THRESHOLD:
-        await update.message.reply_text("Choose a threshold between 1 and 254.")
+        await update.message.reply_text(
+            "Choose a threshold between 1 and 254."
+        )
         return
+
     set_settings(user_id, "manual", value)
+
     await update.message.reply_text(
         f"Manual threshold set to {value}. Send an image to convert it.\n"
         "Use /auto to return to automatic thresholding."
     )
 
 
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mode, threshold = get_settings(update.effective_user.id)
-    shown = "Otsu (automatic per image)" if mode == "auto" else str(threshold)
+async def status_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    mode, threshold = get_settings(
+        update.effective_user.id
+    )
+
+    shown = (
+        "Otsu (automatic per image)"
+        if mode == "auto"
+        else str(threshold)
+    )
+
     await update.message.reply_text(
-        f"Mode: {mode}\nThreshold: {shown}\n"
-        "Output: black #000000 SVG paths, transparent background\n"
-        f"Speck filter: connected components smaller than {MIN_COMPONENT_AREA:g} px are removed."
+        f"Mode: {mode}\n"
+        f"Threshold: {shown}\n"
+        "Output: black #000000 SVG paths, transparent background."
     )
 
 
-async def get_image_bytes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ============================================================
+# INLINE MENU CALLBACKS
+# ============================================================
+
+async def menu_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    action = query.data
+
+    if action == "menu_convert":
+        await query.message.reply_text(
+            "Send a logo as a photo or image document. "
+            "Sending a PNG as a document usually preserves more detail."
+        )
+
+    elif action == "menu_auto":
+        _, threshold = get_settings(user_id)
+        set_settings(user_id, "auto", threshold)
+
+        await query.message.reply_text(
+            "Automatic threshold enabled."
+        )
+
+    elif action == "menu_threshold":
+        mode, threshold = get_settings(user_id)
+
+        await query.message.reply_text(
+            f"Current mode: {mode}\n"
+            f"Manual threshold: {threshold}\n\n"
+            "Set a value with /threshold 160."
+        )
+
+    elif action == "menu_status":
+        mode, threshold = get_settings(user_id)
+
+        await query.message.reply_text(
+            f"Mode: {mode}\nThreshold: {threshold}"
+        )
+
+    elif action == "menu_help":
+        await query.message.reply_text(
+            HELP_TEXT,
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(),
+        )
+
+
+# ============================================================
+# IMAGE DOWNLOAD
+# ============================================================
+
+async def get_image_bytes(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     message = update.message
+
     if message.photo:
-        file_obj = await context.bot.get_file(message.photo[-1].file_id)
+        file_obj = await context.bot.get_file(
+            message.photo[-1].file_id
+        )
         filename = "image.jpg"
+
     elif message.document:
         doc = message.document
         mime = (doc.mime_type or "").lower()
         name = doc.file_name or "image"
-        allowed_ext = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
-        if not (mime.startswith("image/") or name.lower().endswith(allowed_ext)):
-            raise ValueError("Please send an image file (PNG, JPG, WEBP, BMP or TIFF).")
-        if doc.file_size and doc.file_size > MAX_DOWNLOAD_BYTES:
-            raise ValueError("That file is too large. Please send an image under 20 MB.")
+
+        allowed_extensions = (
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".webp",
+            ".bmp",
+            ".tif",
+            ".tiff",
+        )
+
+        if not (
+            mime.startswith("image/")
+            or name.lower().endswith(allowed_extensions)
+        ):
+            raise ValueError(
+                "Please send PNG, JPG, WEBP, BMP or TIFF."
+            )
+
+        if (
+            doc.file_size
+            and doc.file_size > MAX_DOWNLOAD_BYTES
+        ):
+            raise ValueError(
+                "Please send an image under 20 MB."
+            )
+
         file_obj = await context.bot.get_file(doc.file_id)
         filename = name
+
     else:
-        raise ValueError("Please send an image as a photo or image document.")
+        raise ValueError(
+            "Please send an image as a photo or image document."
+        )
 
     downloaded = await file_obj.download_as_bytearray()
+
     if len(downloaded) > MAX_DOWNLOAD_BYTES:
-        raise ValueError("That file is too large. Please send an image under 20 MB.")
+        raise ValueError(
+            "Please send an image under 20 MB."
+        )
+
     return bytes(downloaded), filename
 
 
-async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ============================================================
+# IMAGE HANDLER
+# ============================================================
+
+async def image_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     message = update.message
+
     if not message:
         return
+
     try:
-        image_bytes, original_name = await get_image_bytes(update, context)
-        mode, threshold = get_settings(update.effective_user.id)
-        await message.reply_text("Tracing with VTracer… if it fails, I’ll automatically try the OpenCV engine.")
-        await context.bot.send_chat_action(
-            chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_DOCUMENT
+        image_bytes, original_name = await get_image_bytes(
+            update,
+            context,
         )
-        svg_bytes, info = make_svg(image_bytes, mode, threshold)
+
+        mode, threshold = get_settings(
+            update.effective_user.id
+        )
+
+        await message.reply_text(
+            "Tracing with VTracer… if its output is invalid, "
+            "I'll automatically try OpenCV."
+        )
+
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id,
+            action=ChatAction.UPLOAD_DOCUMENT,
+        )
+
+        svg_bytes, info = make_svg(
+            image_bytes,
+            mode,
+            threshold,
+        )
+
         stem = Path(original_name).stem or "vector"
-        safe_stem = "".join(c if c.isalnum() or c in "-_" else "_" for c in stem)[:48]
+
+        safe_stem = "".join(
+            character
+            if character.isalnum() or character in "-_"
+            else "_"
+            for character in stem
+        )[:48]
+
         output = io.BytesIO(svg_bytes)
         output.name = f"{safe_stem}_black_transparent.svg"
+
         caption = (
-            f"✅ SVG ready\nCanvas: {info['width']} × {info['height']} px\n"
+            f"✅ SVG ready\n"
+            f"Canvas: {info['width']} × {info['height']} px\n"
             f"Threshold: {info['threshold']} ({info['mode']})\n"
             f"Vector paths: {info['contours']}\n"
             f"Engine: {info['engine']}\n"
             "Foreground: #000000 · Background: transparent"
         )
-        await message.reply_document(document=output, filename=output.name, caption=caption)
+
+        await message.reply_document(
+            document=output,
+            filename=output.name,
+            caption=caption,
+        )
+
     except ValueError as exc:
         await message.reply_text(str(exc))
+
     except Exception:
         logger.exception("Image conversion failed")
+
         await message.reply_text(
-            "Something went wrong while converting that image. Try a PNG/JPG with stronger black-and-white contrast."
+            "Conversion failed. Try a high-resolution PNG "
+            "with strong black-and-white contrast."
         )
 
 
-async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Unknown command. Use /help to see available commands.")
+async def unknown_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    await update.message.reply_text(
+        "Unknown command. Use /help to see available commands."
+    )
 
+
+# ============================================================
+# START BOT
+# ============================================================
 
 def main():
     if not BOT_TOKEN:
         raise RuntimeError(
-            "Missing TELEGRAM_BOT_TOKEN environment variable. Add your bot token in Railway Variables."
+            "Missing TELEGRAM_BOT_TOKEN environment variable. "
+            "Add your bot token in Railway Variables."
         )
+
     init_db()
-    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^menu_"))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("auto", auto_command))
-    application.add_handler(CommandHandler("threshold", threshold_command))
-    application.add_handler(CommandHandler("status", status_command))
-    application.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, image_handler))
-    application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
+    application.add_handler(
+        CommandHandler("start", start)
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            menu_callback,
+            pattern=r"^menu_",
+        )
+    )
+
+    application.add_handler(
+        CommandHandler("help", help_command)
+    )
+
+    application.add_handler(
+        CommandHandler("auto", auto_command)
+    )
+
+    application.add_handler(
+        CommandHandler("threshold", threshold_command)
+    )
+
+    application.add_handler(
+        CommandHandler("status", status_command)
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.PHOTO | filters.Document.IMAGE,
+            image_handler,
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.COMMAND,
+            unknown_command,
+        )
+    )
+
     logger.info("Starting MODEX B&W to SVG bot")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
 
 
 if __name__ == "__main__":
