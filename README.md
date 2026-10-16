@@ -69,6 +69,10 @@ Without a volume, the bot still works, but saved settings may reset when the con
 
 This bot uses Telegram long polling and should run as a worker/background service, not as an HTTP web server. Run only one replica for a given bot token.
 
+## Logo tracing engine
+
+The bot uses VTracer spline tracing with corner detection to produce cleaner curves and crisp logo edges. It thresholds the image first, avoids blur and morphological opening, and filters tiny isolated components conservatively. White tracing/background shapes are removed from the final SVG so the canvas remains transparent. For best results, send a high-resolution PNG as a document.
+
 ## How tracing works
 
 1. Normalize the image and convert it to grayscale.
@@ -76,8 +80,9 @@ This bot uses Telegram long polling and should run as a worker/background servic
 3. Respect existing transparency.
 4. Remove small noise and contours.
 5. Simplify contours and write them as SVG paths.
-6. Use black fill and an even-odd fill rule to preserve enclosed cutouts.
-7. Do not embed the original bitmap in the SVG.
+6. Use VTracer spline tracing with corner detection for cleaner paths.
+7. Remove white tracing/background shapes so the SVG background is transparent.
+8. Do not embed the original bitmap in the SVG.
 
 ## Limitations
 
