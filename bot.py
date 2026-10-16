@@ -4,6 +4,7 @@ import sqlite3
 import logging
 import tempfile
 import xml.etree.ElementTree as ET
+import re
 from pathlib import Path
 
 import cv2
@@ -29,6 +30,11 @@ MIN_THRESHOLD = 1
 MAX_THRESHOLD = 254
 MIN_COMPONENT_AREA = 2.0
 PADDING = 2
+
+VTRACER_FILTER_SPECKLE = 2
+VTRACER_CORNER_THRESHOLD = 60
+VTRACER_LENGTH_THRESHOLD = 3.5
+VTRACER_PATH_PRECISION = 3
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -92,13 +98,58 @@ def threshold_mask(gray: np.ndarray, mode: str, threshold: int):
     return mask, int(threshold)
 
 
+def _opencv_fallback_svg(mask: np.ndarray) -> tuple[bytes, int, int, int]:
+    """Build a crisp, transparent SVG from contours if VTracer fails."""
+    contours, hierarchy = cv2.findContours(
+        mask.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if not contours:
+        raise ValueError("OpenCV couldn't find any usable logo contours.")
+
+    paths = []
+    for contour in contours:
+        area = abs(float(cv2.contourArea(contour)))
+        if area < MIN_COMPONENT_AREA:
+            continue
+        perimeter = cv2.arcLength(contour, True)
+        epsilon = max(0.15, perimeter * 0.0005)
+        approx = cv2.approxPolyDP(contour, epsilon, True).reshape(-1, 2)
+        if len(approx) < 3:
+            continue
+        d = f"M {int(approx[0][0])} {int(approx[0][1])} "
+        d += " ".join(f"L {int(x)} {int(y)}" for x, y in approx[1:])
+        d += " Z"
+        paths.append(d)
+
+    if not paths:
+        raise ValueError("OpenCV couldn't generate usable vector paths.")
+
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0:
+        raise ValueError("No foreground pixels were found for fallback tracing.")
+    min_x = max(0, int(xs.min()) - PADDING)
+    min_y = max(0, int(ys.min()) - PADDING)
+    max_x = min(mask.shape[1] - 1, int(xs.max()) + PADDING)
+    max_y = min(mask.shape[0] - 1, int(ys.max()) + PADDING)
+    width = max(1, max_x - min_x + 1)
+    height = max(1, max_y - min_y + 1)
+    svg = f'''<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="{min_x} {min_y} {width} {height}">
+  <path d="{' '.join(paths)}" fill="#000000" fill-rule="evenodd" clip-rule="evenodd"/>
+</svg>
+'''.encode("utf-8")
+    return svg, width, height, len(paths)
+
+
 def make_svg(image_bytes: bytes, mode: str, threshold: int):
-    """Trace black logo artwork with VTracer spline paths and a transparent canvas."""
+    """Try VTracer first; automatically fall back to crisp OpenCV paths."""
     try:
         with Image.open(io.BytesIO(image_bytes)) as opened:
             image = ImageOps.exif_transpose(opened).convert("RGBA")
     except (UnidentifiedImageError, OSError) as exc:
-        raise ValueError("I couldn't read that image. Please send a PNG, JPG, WEBP, BMP or TIFF.") from exc
+        raise ValueError(
+            "I couldn't read that image. Please send a PNG, JPG, WEBP, BMP or TIFF."
+        ) from exc
 
     rgba = np.array(image)
     alpha = rgba[:, :, 3]
@@ -106,88 +157,21 @@ def make_svg(image_bytes: bytes, mode: str, threshold: int):
     mask, used_threshold = threshold_mask(gray, mode, threshold)
     mask[alpha < 10] = 0
 
-    # Remove only tiny isolated components. No blur or morphology is applied,
-    # so thin cuts and sharp logo details are not rounded or erased.
-    count, labels, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), 8)
+    # Conservative cleanup: no blur/morphology, preserving fine logo cuts.
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        (mask > 0).astype(np.uint8), 8
+    )
     cleaned = np.zeros_like(mask)
     for label in range(1, count):
-        area = int(stats[label, cv2.CC_STAT_AREA])
-        if area >= MIN_COMPONENT_AREA:
+        if int(stats[label, cv2.CC_STAT_AREA]) >= MIN_COMPONENT_AREA:
             cleaned[labels == label] = 255
 
     if not np.any(cleaned):
-        raise ValueError("No dark artwork was detected. Try /threshold 190, or send a higher-contrast image.")
+        raise ValueError(
+            "No dark artwork was detected. Try /threshold 190, or send a higher-contrast image."
+        )
 
-    # VTracer takes a raster file. Feed it a clean black/white image; then
-    # convert its traced contours into a single even-odd path so enclosed
-    # cutouts stay empty instead of being filled with white.
     h, w = cleaned.shape
-    bw = np.full((h, w, 3), 255, dtype=np.uint8)
-    bw[cleaned > 0] = (0, 0, 0)
-
-    with tempfile.TemporaryDirectory(prefix="modex_vtracer_") as tmp:
-        input_path = Path(tmp) / "input.png"
-        output_path = Path(tmp) / "traced.svg"
-        Image.fromarray(bw, mode="RGB").save(input_path, format="PNG")
-        try:
-            vtracer.convert_image_to_svg_py(
-                str(input_path),
-                str(output_path),
-                colormode="binary",
-                hierarchical="stacked",
-                mode="spline",
-                filter_speckle=VTRACER_FILTER_SPECKLE,
-                color_precision=6,
-                layer_difference=16,
-                corner_threshold=VTRACER_CORNER_THRESHOLD,
-                length_threshold=VTRACER_LENGTH_THRESHOLD,
-                max_iterations=10,
-                splice_threshold=45,
-                path_precision=VTRACER_PATH_PRECISION,
-            )
-        except Exception as exc:
-            logger.exception("VTracer conversion failed")
-            raise ValueError("VTracer couldn't trace this image. Try a higher-resolution PNG or JPG.") from exc
-
-        try:
-            root = ET.parse(output_path).getroot()
-        except (ET.ParseError, OSError) as exc:
-            raise ValueError("The vectorizer returned an invalid SVG. Please try another image.") from exc
-
-    # Collect vector path data. VTracer's binary output can contain white
-    # regions as separate layers; edge-touching white regions are background.
-    # Interior contours are included in one even-odd path to preserve cutouts.
-    path_data = []
-    number_re = re.compile(r"[-+]?(?:\d*\.\d+|\d+\.?\d*)(?:[eE][-+]?\d+)?")
-    ns = "{http://www.w3.org/2000/svg}"
-
-    for element in root.iter():
-        if not element.tag.endswith("path"):
-            continue
-        d = element.attrib.get("d", "").strip()
-        if not d:
-            continue
-        fill = element.attrib.get("fill", "#000000").strip().lower()
-        nums = [float(n) for n in number_re.findall(d)]
-        if len(nums) >= 4:
-            xs = nums[0::2]
-            ys = nums[1::2]
-            touches_edge = (
-                min(xs) <= 1.0 or min(ys) <= 1.0
-                or max(xs) >= w - 1.0 or max(ys) >= h - 1.0
-            )
-        else:
-            touches_edge = False
-
-        is_white = fill in {"white", "#fff", "#ffffff", "rgb(255,255,255)"}
-        if is_white and touches_edge:
-            continue
-        path_data.append(d)
-
-    if not path_data:
-        raise ValueError("No usable vector paths were generated. Try /threshold 190.")
-
-    # Trim the canvas to the detected foreground bounds and translate paths.
     ys, xs = np.where(cleaned > 0)
     min_x = max(0, int(xs.min()) - PADDING)
     min_y = max(0, int(ys.min()) - PADDING)
@@ -196,20 +180,60 @@ def make_svg(image_bytes: bytes, mode: str, threshold: int):
     width = max(1, max_x - min_x + 1)
     height = max(1, max_y - min_y + 1)
 
-    # Translate using an SVG group; VTracer path coordinates remain untouched.
-    svg = f"""<?xml version="1.0" encoding="UTF-8"?>
+    try:
+        bw = np.full((h, w, 3), 255, dtype=np.uint8)
+        bw[cleaned > 0] = (0, 0, 0)
+        with tempfile.TemporaryDirectory(prefix="modex_vtracer_") as tmp:
+            input_path = Path(tmp) / "input.png"
+            output_path = Path(tmp) / "traced.svg"
+            Image.fromarray(bw, mode="RGB").save(input_path, format="PNG")
+            vtracer.convert_image_to_svg_py(
+                str(input_path), str(output_path),
+                colormode="binary", hierarchical="stacked", mode="spline",
+                filter_speckle=VTRACER_FILTER_SPECKLE,
+                color_precision=6, layer_difference=16,
+                corner_threshold=VTRACER_CORNER_THRESHOLD,
+                length_threshold=VTRACER_LENGTH_THRESHOLD,
+                max_iterations=10, splice_threshold=45,
+                path_precision=VTRACER_PATH_PRECISION,
+            )
+            root = ET.parse(output_path).getroot()
+
+        path_data = []
+        for element in root.iter():
+            if not element.tag.endswith("path"):
+                continue
+            d = element.attrib.get("d", "").strip()
+            if not d:
+                continue
+            fill = element.attrib.get("fill", "#000000").strip().lower()
+            if fill in {"white", "#fff", "#ffffff", "rgb(255,255,255)"}:
+                continue
+            path_data.append(d)
+
+        if not path_data:
+            raise ValueError("VTracer returned no foreground paths.")
+
+        svg = f'''<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="{min_x} {min_y} {width} {height}">
-  <path d="{' '.join(path_data)}" fill="#000000" fill-rule="evenodd" clip-rule="evenodd"/>
+  <g fill="#000000">{' '.join(f'<path d="{d}" fill-rule="evenodd"/>' for d in path_data)}</g>
 </svg>
-""".encode("utf-8")
+'''.encode("utf-8")
+        engine = "VTracer spline"
+        path_count = len(path_data)
+
+    except Exception as exc:
+        logger.warning("VTracer failed; falling back to OpenCV: %s", exc)
+        svg, width, height, path_count = _opencv_fallback_svg(cleaned)
+        engine = "OpenCV fallback"
 
     return svg, {
         "width": width,
         "height": height,
-        "contours": len(path_data),
+        "contours": path_count,
         "threshold": used_threshold,
         "mode": mode,
-        "engine": "VTracer spline",
+        "engine": engine,
     }
 
 
@@ -376,7 +400,7 @@ async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         image_bytes, original_name = await get_image_bytes(update, context)
         mode, threshold = get_settings(update.effective_user.id)
-        await message.reply_text("Tracing your image with VTracer spline mode…")
+        await message.reply_text("Tracing with VTracer… if it fails, I’ll automatically try the OpenCV engine.")
         await context.bot.send_chat_action(
             chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_DOCUMENT
         )
@@ -389,7 +413,7 @@ async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ SVG ready\nCanvas: {info['width']} × {info['height']} px\n"
             f"Threshold: {info['threshold']} ({info['mode']})\n"
             f"Vector paths: {info['contours']}\n"
-            "Engine: VTracer spline\n"
+            f"Engine: {info['engine']}\n"
             "Foreground: #000000 · Background: transparent"
         )
         await message.reply_document(document=output, filename=output.name, caption=caption)
